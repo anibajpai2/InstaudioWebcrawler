@@ -1,205 +1,219 @@
 #!/usr/bin/env python3
 """
-INSTAUDIO.IO FULL CRAWLER (3-digit + 4-digit codes)
-→ Finds every existing audio with title, duration, listens, downloads
-→ Saves everything to instaudio_results.csv
-→ Super fast with multithreading (adjustable)
-→ Auto-resumes if you stop and restart
-
-Just run it → it starts downloading metadata immediately!
+Modernized instaud.io crawler (asyncio + aiohttp)
+Much lower memory & CPU usage, better concurrency
 """
-
-import requests
-from bs4 import BeautifulSoup
+import asyncio
 import csv
 import time
-import os
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from itertools import product
-import string
-import sys
+from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
+from typing import AsyncGenerator, Optional
 
-# ========================= CONFIGURATION =========================
+import aiohttp
+from aiohttp import ClientTimeout
+from bs4 import BeautifulSoup
+from tqdm.asyncio import tqdm_asyncio
+
+# ────────────────────────────────────────────────
+#  CONFIG
+# ────────────────────────────────────────────────
+
 BASE_URL = "https://instaud.io/"
-OUTPUT_FILE = "instaudio_results.csv"
-THREADS = 15          # ← Change this: 5 = safe & fast, 20+ = very fast (risk of temp block)
-BATCH_SIZE = 500      # How many URLs to process before saving progress
-INCLUDE_3DIGIT = True # Set to False if you only want 4-digit (1000–3ZZZ)
-# ==================================================================
+OUTPUT_FILE = Path("instaudio_results.csv")
+CONCURRENT = 80              # tune: 40–150 depending on your connection
+BATCH_SIZE = 2000            # save every X items
+INCLUDE_3DIGIT = True
+MIN_CODE_LENGTH = 3
 
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
 }
 
-# Base36 characters
-CHARS = '0123456789abcdefghijklmnopqrstuvwxyz'
+CHARS = "0123456789abcdefghijklmnopqrstuvwxyz"
 
-def code_to_url(code: str) -> str:
-    return f"{BASE_URL}{code}"
+# ────────────────────────────────────────────────
 
-def parse_duration(text: str) -> int:
-    if not text or ':' not in text:
-        return 0
-    parts = text.strip().split(':')
-    try:
-        if len(parts) == 3:  # H:MM:SS
-            h, m, s = map(float, parts)
-            return int(h*3600 + m*60 + s)
-        else:  # M:SS
-            m, s = map(float, parts)
-            return int(m*60 + s)
-    except:
-        return 0
+@dataclass
+class AudioEntry:
+    code: str
+    url: str
+    status: int | str
+    title: str = ""
+    duration: str = ""
+    duration_sec: int = 0
+    listens: str = "0"
+    downloads: str = "0"
+    error: str = ""
 
-def extract_metadata(url: str) -> dict:
-    try:
-        # Fast check if page exists
-        head = requests.head(url, headers=HEADERS, timeout=10, allow_redirects=True)
-        if head.status_code != 200:
-            return {"url": url, "status": head.status_code}
-
-        r = requests.get(url, headers=HEADERS, timeout=15)
-        if r.status_code != 200:
-            return {"url": url, "status": r.status_code}
-
-        soup = BeautifulSoup(r.content, 'html.parser')
-
-        # Title
-        title = soup.find('title')
-        title_text = title.get_text(strip=True).replace(' - Instaudio', '').strip() if title else "Unknown"
-
-        # Duration
-        time_tag = soup.find('time')
-        duration_raw = time_tag.get_text(strip=True) if time_tag else ""
-        duration_sec = parse_duration(duration_raw)
-        duration_fmt = f"{duration_sec // 60:02d}:{duration_sec % 60:02d}" if duration_sec else "?:??"
-
-        # Stats (listens & downloads)
-        page_text = soup.get_text()
-        listens = "0"
-        downloads = "0"
-        import re
-        listens_match = re.search(r'(\d+(?:,\d+)?)\s*listen', page_text, re.I)
-        downloads_match = re.search(r'(\d+(?:,\d+)?)\s*download', page_text, re.I)
-        if listens_match:
-            listens = listens_match.group(1).replace(',', '')
-        if downloads_match:
-            downloads = downloads_match.group(1).replace(',', '')
-
+    def as_dict(self) -> dict:
         return {
-            "url": url,
-            "code": url.split('/')[-1],
-            "title": title_text,
-            "duration": duration_fmt,
-            "duration_seconds": duration_sec,
-            "listens": listens,
-            "downloads": downloads,
-            "status": 200
+            "code": self.code,
+            "url": self.url,
+            "status": self.status,
+            "title": self.title,
+            "duration": self.duration,
+            "duration_seconds": self.duration_sec,
+            "listens": self.listens,
+            "downloads": self.downloads,
+            "error": self.error,
         }
+
+
+def parse_duration(text: str) -> tuple[int, str]:
+    if not text or ":" not in text:
+        return 0, "?:??"
+    try:
+        parts = [float(p) for p in text.strip().split(":")]
+        if len(parts) == 3:  # h:mm:ss
+            sec = int(parts[0] * 3600 + parts[1] * 60 + parts[2])
+        else:  # mm:ss
+            sec = int(parts[0] * 60 + parts[1])
+        return sec, f"{sec // 60:02d}:{sec % 60:02d}"
+    except:
+        return 0, "?:??"
+
+
+async def fetch_metadata(
+    session: aiohttp.ClientSession, code: str
+) -> AudioEntry:
+    url = f"{BASE_URL}{code}"
+    entry = AudioEntry(code=code, url=url, status="UNKNOWN")
+
+    try:
+        async with session.get(url, headers=HEADERS, timeout=ClientTimeout(total=12)) as resp:
+            entry.status = resp.status
+            if resp.status != 200:
+                return entry
+
+            html = await resp.text()
+            soup = BeautifulSoup(html, "html.parser")
+
+            # Title
+            title_tag = soup.find("title")
+            if title_tag:
+                entry.title = (
+                    title_tag.get_text(strip=True)
+                    .removesuffix(" - Instaudio")
+                    .strip()
+                ) or "Unknown"
+
+            # Duration
+            time_tag = soup.find("time")
+            if time_tag:
+                dur_text = time_tag.get_text(strip=True)
+                entry.duration_sec, entry.duration = parse_duration(dur_text)
+
+            # Listens & downloads (fallback to regex if structure changed)
+            text = soup.get_text(separator=" ", strip=True)
+            import re
+
+            if m := re.search(r"(\d+(?:,\d+)?)\s*listen", text, re.I):
+                entry.listens = m.group(1).replace(",", "")
+            if m := re.search(r"(\d+(?:,\d+)?)\s*download", text, re.I):
+                entry.downloads = m.group(1).replace(",", "")
+
     except Exception as e:
-        return {"url": url, "status": "ERROR", "error": str(e)[:100]}
+        entry.status = "ERROR"
+        entry.error = str(e)[:120]
 
-def generate_3digit_codes():
-    for a, b, c in product(CHARS, repeat=3):
-        code = f"{a}{b}{c}"
-        if code == "000":  # skip placeholder
+    return entry
+
+
+def code_generator(min_len: int = 3, max_len: int = 4) -> AsyncGenerator[str, None]:
+    """Generate base36 codes from length min_len to max_len"""
+    for length in range(min_len, max_len + 1):
+        if length == 3 and not INCLUDE_3DIGIT:
             continue
-        yield code
-
-def generate_4digit_codes():
-    # From 1000 → 3ZZZ in base36
-    for first in '123':  # 1xxx, 2xxx, 3xxx
-        if first == '1':
-            start = 0
-        else:
-            start = CHARS.index(first) * 36**3
-        for num in range(start, start + 36**3):
-            if first == '3' and num >= 36**4:  # don't go into 4xxx
-                break
+        # We could skip "000" etc. here if desired
+        for i in range(36**length):
             code = ""
-            n = num
-            for _ in range(4):
+            n = i
+            for _ in range(length):
                 code = CHARS[n % 36] + code
                 n //= 36
-            if code and code[0] == first:
-                yield code
+            # Optional: skip padded zeros if you want
+            # if code.lstrip("0") == "": continue
+            yield code
 
-def save_results(results, append=True):
-    mode = 'a' if append and os.path.exists(OUTPUT_FILE) else 'w'
-    with open(OUTPUT_FILE, mode, newline='', encoding='utf-8') as f:
-        fieldnames = ["url", "code", "title", "duration", "duration_seconds", "listens", "downloads", "status", "error"]
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
-        if mode == 'w':
+
+async def main():
+    OUTPUT_FILE.unlink(missing_ok=True)  # optional: start fresh
+
+    total = 0
+    batch: list[AudioEntry] = []
+    start_time = time.monotonic()
+
+    connector = aiohttp.TCPConnector(limit=CONCURRENT + 10)
+    async with aiohttp.ClientSession(connector=connector) as session:
+        codes = code_generator(MIN_CODE_LENGTH, 4)
+        tasks = []
+
+        async for code in tqdm_asyncio(codes, desc="Scanning codes", unit="code"):
+            tasks.append(fetch_metadata(session, code))
+
+            if len(tasks) >= CONCURRENT * 2:  # oversubscribe a bit
+                done, tasks = await asyncio.wait(
+                    tasks, return_when=asyncio.FIRST_COMPLETED
+                )
+                for fut in done:
+                    entry = await fut
+                    total += 1
+                    if entry.status == 200:
+                        print(f"  HIT → {entry.code}  {entry.title[:48]}", flush=True)
+                    batch.append(entry)
+
+                    if len(batch) >= BATCH_SIZE:
+                        await save_batch(batch)
+                        batch.clear()
+
+        # Drain remaining tasks
+        if tasks:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            for r in results:
+                if isinstance(r, Exception):
+                    continue
+                batch.append(r)
+                total += 1
+
+        if batch:
+            await save_batch(batch)
+
+    elapsed = time.monotonic() - start_time
+    print(f"\nFinished. Found {total:,} checked codes in {elapsed:.1f} s")
+    print(f"Results → {OUTPUT_FILE}")
+
+
+async def save_batch(entries: list[AudioEntry]):
+    if not entries:
+        return
+
+    fieldnames = [
+        "code",
+        "url",
+        "status",
+        "title",
+        "duration",
+        "duration_seconds",
+        "listens",
+        "downloads",
+        "error",
+    ]
+
+    mode = "a" if OUTPUT_FILE.exists() else "w"
+    with OUTPUT_FILE.open(mode, newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if mode == "w":
             writer.writeheader()
-        for row in results:
-            row.setdefault("error", "")
-            writer.writerow({k: v for k, v in row.items() if k in fieldnames})
+        writer.writerows(e.as_dict() for e in entries)
 
-def main():
-    print("INSTAUDIO.IO MASS CRAWLER STARTED")
-    print(f"→ Saving to: {OUTPUT_FILE}")
-    print(f"→ Using {THREADS} threads")
-    print(f"→ 3-digit codes: {'YES' if INCLUDE_3DIGIT else 'NO'}")
-    print("-" * 60)
+    print(f"  Saved {len(entries):,} rows", flush=True)
 
-    total_found = 0
-    batch_results = []
-
-    generators = []
-    if INCLUDE_3DIGIT:
-        generators.append(("3-digit", generate_3digit_codes()))
-    generators.append(("4-digit", generate_4digit_codes()))
-
-    for name, gen in generators:
-        print(f"\nStarting {name} scan...")
-        batch_count = 0
-        urls_batch = []
-
-        for code in gen:
-            url = code_to_url(code)
-            urls_batch.append(url)
-
-            if len(urls_batch) >= BATCH_SIZE:
-                batch_count += 1
-                print(f"  Processing batch {batch_count} ({len(urls_batch)} URLs)... ", end="")
-
-                with ThreadPoolExecutor(max_workers=THREADS) as executor:
-                    futures = {executor.submit(extract_metadata, u): u for u in urls_batch}
-                    for future in as_completed(futures):
-                        result = future.result()
-                        if result["status"] == 200:
-                            total_found += 1
-                            print("+", end="", flush=True)
-                        else:
-                            print(".", end="", flush=True)
-                        batch_results.append(result)
-
-                print(f" → {total_found} audios found so far")
-                save_results(batch_results, append=True)
-                batch_results.clear()
-                urls_batch.clear()
-                time.sleep(0.5)  # Be gentle
-
-        # Final batch
-        if urls_batch:
-            print(f"  Final {name} batch... ", end="")
-            with ThreadPoolExecutor(max_workers=THREADS) as executor:
-                for url in urls_batch:
-                    batch_results.append(extract_metadata(url))
-            save_results(batch_results, append=True)
-            good = len([r for r in batch_results if r["status"] == 200])
-            total_found += good
-            print(f"Done! (+{good})")
-
-    print("\n" + "="*60)
-    print(f"ALL DONE! Found {total_found} existing audios")
-    print(f"Results saved → {OUTPUT_FILE}")
-    print("You can now sort/filter the CSV in Excel or Google Sheets")
-    print("="*60)
 
 if __name__ == "__main__":
     try:
-        main()
+        asyncio.run(main())
     except KeyboardInterrupt:
-        print("\n\nStopped by user. Progress is saved — you can run again to continue!")
-        sys.exit(0)
+        print("\nInterrupted. Partial results saved.")
